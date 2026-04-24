@@ -50,7 +50,6 @@ static replacement_policy_e g_policy;
 /* ── LRU helpers ─────────────────────────────────────────────────────── */
 
 static void l1d_touch(uint32_t idx, int way) {
-    /* other way becomes LRU */
     l1d_lru[idx] = 1 - way;
 }
 
@@ -82,10 +81,63 @@ static int l2_pick_victim(uint32_t idx) {
     return l2_lru_way(idx);
 }
 
+/* ── Forward declarations (coherence helpers call l2_writeback) ──────── */
+static void l2_writeback(uint64_t base, cache_line_t *dirty);
+
+/* ── Coherence helpers ───────────────────────────────────────────────────
+   These are NOT cache accesses and do not increment L1 stats.
+   A dirty-line flush to L2 DOES count as an L2 access (write from L1).   */
+
+/* If L1I has base dirty, write it back to L2 (L2 access) and clear
+   the modified bit.  The L1I line stays valid (flush, not evict). */
+static void coherence_flush_l1i(uint64_t base) {
+    uint32_t i = L1I_INDEX(base);
+    if (l1i[i][0].valid && l1i[i][0].tag == L1I_TAG(base) &&
+            l1i[i][0].modified) {
+        l2_writeback(base, &l1i[i][0]);
+        l1i[i][0].modified = 0;
+    }
+}
+
+/* If L1D has base dirty (any way), write it back to L2 and clear modified. */
+static void coherence_flush_l1d(uint64_t base) {
+    uint32_t i = L1D_INDEX(base);
+    uint64_t t = L1D_TAG(base);
+    for (int w = 0; w < HW11_L1_DATA_ASSOC; w++) {
+        if (l1d[i][w].valid && l1d[i][w].tag == t && l1d[i][w].modified) {
+            l2_writeback(base, &l1d[i][w]);
+            l1d[i][w].modified = 0;
+            break;
+        }
+    }
+}
+
+/* Flush L1I (if dirty) then invalidate it.  Called on DATA writes. */
+static void coherence_invalidate_l1i(uint64_t base) {
+    uint32_t i = L1I_INDEX(base);
+    if (l1i[i][0].valid && l1i[i][0].tag == L1I_TAG(base)) {
+        if (l1i[i][0].modified)
+            l2_writeback(base, &l1i[i][0]);   /* L2 access */
+        l1i[i][0].valid = l1i[i][0].modified = 0;
+    }
+}
+
+/* Flush L1D (if dirty) then invalidate it.  Called on INSTR writes. */
+static void coherence_invalidate_l1d(uint64_t base) {
+    uint32_t i = L1D_INDEX(base);
+    uint64_t t = L1D_TAG(base);
+    for (int w = 0; w < HW11_L1_DATA_ASSOC; w++) {
+        if (l1d[i][w].valid && l1d[i][w].tag == t) {
+            if (l1d[i][w].modified)
+                l2_writeback(base, &l1d[i][w]);   /* L2 access */
+            l1d[i][w].valid = l1d[i][w].modified = 0;
+            break;
+        }
+    }
+}
+
 /* ── L2 eviction (inclusive: must flush L1 first) ───────────────────── */
 
-/* Called before L2 evicts a valid line.  Flushes any L1 lines covering
-   vbase directly to memory (not counted as an access per spec). */
 static void l2_evict_line(uint32_t idx, int way) {
     cache_line_t *vl = &l2c[idx][way];
     if (!vl->valid) return;
@@ -93,11 +145,12 @@ static void l2_evict_line(uint32_t idx, int way) {
     uint64_t vbase = L2_BASE(vl->tag, idx);
     bool l1_wrote = false;
 
-    /* L1I */
+    /* L1I — forced writeback counts as an L2 access */
     {
         uint32_t i = L1I_INDEX(vbase);
         if (l1i[i][0].valid && l1i[i][0].tag == L1I_TAG(vbase)) {
             if (l1i[i][0].modified) {
+                l2_stats.accesses++;           /* forced L1→L2 writeback */
                 for (int b = 0; b < LINE_SIZE; b++)
                     write_memory(vbase + b, l1i[i][0].data[b]);
                 l1_wrote = true;
@@ -106,13 +159,14 @@ static void l2_evict_line(uint32_t idx, int way) {
         }
     }
 
-    /* L1D */
+    /* L1D — forced writeback counts as an L2 access */
     {
         uint32_t i  = L1D_INDEX(vbase);
         uint64_t dt = L1D_TAG(vbase);
         for (int w = 0; w < HW11_L1_DATA_ASSOC; w++) {
             if (l1d[i][w].valid && l1d[i][w].tag == dt) {
                 if (l1d[i][w].modified) {
+                    l2_stats.accesses++;       /* forced L1→L2 writeback */
                     for (int b = 0; b < LINE_SIZE; b++)
                         write_memory(vbase + b, l1d[i][w].data[b]);
                     l1_wrote = true;
@@ -123,7 +177,6 @@ static void l2_evict_line(uint32_t idx, int way) {
         }
     }
 
-    /* Write L2's own dirty data only if L1 didn't provide a fresher copy */
     if (!l1_wrote && vl->modified)
         for (int b = 0; b < LINE_SIZE; b++)
             write_memory(vbase + b, vl->data[b]);
@@ -133,8 +186,6 @@ static void l2_evict_line(uint32_t idx, int way) {
 
 /* ── L2 access (called by L1 on miss or writeback) ───────────────────── */
 
-/* Fetch the L2 line covering base into the cache and return a pointer.
-   Counts as 1 L2 access. */
 static cache_line_t *l2_fetch(uint64_t base) {
     uint32_t idx = L2_INDEX(base);
     uint64_t tag = L2_TAG(base);
@@ -148,7 +199,6 @@ static cache_line_t *l2_fetch(uint64_t base) {
         }
     }
 
-    /* Miss */
     l2_stats.misses++;
     int v = l2_pick_victim(idx);
     l2_evict_line(idx, v);
@@ -163,7 +213,6 @@ static cache_line_t *l2_fetch(uint64_t base) {
     return line;
 }
 
-/* Write dirty L1 line back into L2.  Counts as 1 L2 access. */
 static void l2_writeback(uint64_t base, cache_line_t *dirty) {
     uint32_t idx = L2_INDEX(base);
     uint64_t tag = L2_TAG(base);
@@ -178,7 +227,6 @@ static void l2_writeback(uint64_t base, cache_line_t *dirty) {
             return;
         }
     }
-    /* Should not happen: L2 is inclusive, so the line must be present */
 }
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -189,7 +237,6 @@ void init_cache(replacement_policy_e policy) {
     memset(l1d,      0, sizeof(l1d));
     memset(l2c,      0, sizeof(l2c));
     memset(l1d_lru,  0, sizeof(l1d_lru));
-    /* initialise ages so way 0 is MRU (0) and way ASSOC-1 is LRU */
     for (int i = 0; i < L2_SETS; i++)
         for (int w = 0; w < HW11_L2_ASSOC; w++)
             l2_age[i][w] = w;
@@ -207,18 +254,21 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
         l1i_stats.accesses++;
 
-        /* Hit */
+        /* Hit — L1D cannot be dirty for this block (DATA writes invalidate L1I) */
         if (l1i[idx][0].valid && l1i[idx][0].tag == tag)
             return l1i[idx][0].data[off];
 
         /* Miss */
         l1i_stats.misses++;
 
-        /* Write back dirty evictee to L2 before replacing */
+        /* Evict current L1I occupant if dirty */
         if (l1i[idx][0].valid && l1i[idx][0].modified)
             l2_writeback(L1I_BASE(l1i[idx][0].tag, idx), &l1i[idx][0]);
 
-        /* Load line from L2 */
+        /* Coherence: if L1D has a dirty version, flush it to L2 first so the
+           fetch below gets up-to-date data. */
+        coherence_flush_l1d(base);
+
         cache_line_t *l2l = l2_fetch(base);
         memcpy(l1i[idx][0].data, l2l->data, LINE_SIZE);
         l1i[idx][0].valid    = 1;
@@ -250,6 +300,9 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
         if (l1d[idx][v].valid && l1d[idx][v].modified)
             l2_writeback(L1D_BASE(l1d[idx][v].tag, idx), &l1d[idx][v]);
 
+        /* Coherence: flush dirty L1I to L2 before fetching */
+        coherence_flush_l1i(base);
+
         cache_line_t *l2l = l2_fetch(base);
         memcpy(l1d[idx][v].data, l2l->data, LINE_SIZE);
         l1d[idx][v].valid    = 1;
@@ -274,6 +327,8 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
         if (l1i[idx][0].valid && l1i[idx][0].tag == tag) {
             l1i[idx][0].data[off] = value;
             l1i[idx][0].modified  = 1;
+            /* Coherence: L1D now has stale data for this block */
+            coherence_invalidate_l1d(base);
             return;
         }
 
@@ -283,12 +338,18 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
         if (l1i[idx][0].valid && l1i[idx][0].modified)
             l2_writeback(L1I_BASE(l1i[idx][0].tag, idx), &l1i[idx][0]);
 
+        /* Coherence: flush dirty L1D to L2 before fetching */
+        coherence_flush_l1d(base);
+
         cache_line_t *l2l = l2_fetch(base);
         memcpy(l1i[idx][0].data, l2l->data, LINE_SIZE);
-        l1i[idx][0].valid        = 1;
-        l1i[idx][0].tag          = tag;
-        l1i[idx][0].data[off]    = value;
-        l1i[idx][0].modified     = 1;
+        l1i[idx][0].valid     = 1;
+        l1i[idx][0].tag       = tag;
+        l1i[idx][0].data[off] = value;
+        l1i[idx][0].modified  = 1;
+
+        /* Coherence: invalidate L1D (already flushed above, so just set valid=0) */
+        coherence_invalidate_l1d(base);
 
     } else { /* DATA */
         uint32_t idx  = L1D_INDEX(mem_addr);
@@ -304,6 +365,8 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
                 l1d[idx][w].data[off] = value;
                 l1d[idx][w].modified  = 1;
                 if (g_policy == LRU) l1d_touch(idx, w);
+                /* Coherence: L1I now has stale data for this block */
+                coherence_invalidate_l1i(base);
                 return;
             }
         }
@@ -315,12 +378,15 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
         if (l1d[idx][v].valid && l1d[idx][v].modified)
             l2_writeback(L1D_BASE(l1d[idx][v].tag, idx), &l1d[idx][v]);
 
+        /* Coherence: flush dirty L1I to L2 before fetching */
+        coherence_invalidate_l1i(base);
+
         cache_line_t *l2l = l2_fetch(base);
         memcpy(l1d[idx][v].data, l2l->data, LINE_SIZE);
-        l1d[idx][v].valid        = 1;
-        l1d[idx][v].tag          = tag;
-        l1d[idx][v].data[off]    = value;
-        l1d[idx][v].modified     = 1;
+        l1d[idx][v].valid     = 1;
+        l1d[idx][v].tag       = tag;
+        l1d[idx][v].data[off] = value;
+        l1d[idx][v].modified  = 1;
         if (g_policy == LRU) l1d_touch(idx, v);
     }
 }
