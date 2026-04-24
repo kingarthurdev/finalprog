@@ -37,14 +37,15 @@ static void section(const char *name) {
 /* Three addresses that thrash L1D (2-way) without conflicting in L2. */
 static const uint64_t P[3] = { 0, L1D_STRIDE, 2 * L1D_STRIDE };
 
-/* Five addresses that thrash both L1D (2-way) and L2 (4-way). */
-static const uint64_t Q[6] = {
+/* Addresses that thrash both L1D (2-way) and L2 (4-way). */
+static const uint64_t Q[7] = {
     0,
     1 * (uint64_t)L2_STRIDE,
     2 * (uint64_t)L2_STRIDE,
     3 * (uint64_t)L2_STRIDE,
     4 * (uint64_t)L2_STRIDE,
-    5 * (uint64_t)L2_STRIDE,   /* Q[5] used only in write-back test */
+    5 * (uint64_t)L2_STRIDE,
+    6 * (uint64_t)L2_STRIDE,   /* Q[6] used only in write-back test */
 };
 
 /* ── 1. Basic read / write correctness ───────────────────────────────── */
@@ -171,8 +172,11 @@ static void test_writeback_chain(void) {
           "Q[0] dirty with correct value in L2");
     CHECK(memory[Q[0]] == 0x00, "memory still clean (Q[0] not yet evicted from L2)");
 
-    /* One more conflicting access evicts Q[0] from L2 → flushes to memory. */
+    /* Q[0] was touched (promoted to MRU) in L2 during the L1D writeback when Q[2]
+       was loaded, so Q[2] ages past it. Two more conflicting accesses are needed to
+       push Q[0] back to L2-LRU and then evict it. Q[5] evicts Q[2]; Q[6] evicts Q[0]. */
     read_cache(Q[5], DATA);
+    read_cache(Q[6], DATA);
 
     CHECK(get_l2_cache_line(Q[0]) == NULL, "Q[0] evicted from L2");
     CHECK(memory[Q[0]] == 0xDE,            "memory updated after L2 eviction");
@@ -182,38 +186,40 @@ static void test_writeback_chain(void) {
 /* ── 5. L2 inclusivity: L2 eviction invalidates L1D ─────────────────── */
 
 static void test_l2_inclusivity(void) {
-    section("L2 inclusivity enforcement (RANDOM policy, seed=1)");
+    section("L2 inclusivity enforcement (LRU policy)");
 
-    /* Use a fixed seed so the test is deterministic.
-       With srand(1), rand() produces the sequence:
-         call 1 (L1D pick_victim for Q[2]): 1804289383 % 2 = 1  → evict way1
-         call 2 (L1D pick_victim for Q[3]): 846930886  % 2 = 0  → evict way0
-         call 3 (L1D pick_victim for Q[4]): 1681692777 % 2 = 1  → evict way1
-         call 4 (L2  pick_victim for Q[4]): 1714636915 % 4 = 3  → evict L2 way3 = Q[3]
-       After loading Q[0]-Q[3]: L1D holds Q[2](way0) and Q[3](way1) (from rand calls 1-2).
-       Loading Q[4]:
-         - L1D evicts way1=Q[3] (rand call 3), but BEFORE overwriting, l2_fetch is called
-         - L2 randomly picks way3=Q[3] as victim (rand call 4)
-         - Q[3] IS in L1D (way1), so l2_evict_line invalidates L1D way1
-         - Q[4] is then stored in L1D way1 (the now-invalid slot)              */
-    srand(1);
-    init_cache(RANDOM);
+    /* Strategy: keep Q[0] alive in L1D via repeated L1D hits (which do NOT
+       touch L2), while Q[1]-Q[3] are loaded into L2 making Q[0] the L2-LRU.
+       Then loading Q[4] forces L2 to evict Q[0], which must also invalidate
+       the L1D copy.
+
+       Trace (L2 ages: 0=MRU, 3=LRU):
+         load Q[0]: L2=[Q0:0,_,_,_],  L1D=[Q0,_]
+         load Q[1]: L2=[Q0:1,Q1:0,_,_], L1D=[Q0(LRU),Q1]
+         hit  Q[0]: L1D only (no L2 access), L1D=[Q0(MRU),Q1(LRU)]
+         load Q[2]: L2=[Q0:2,Q1:1,Q2:0,_], L1D evicts Q1→[Q0(LRU),Q2]
+         hit  Q[0]: L1D only, L1D=[Q0(MRU),Q2(LRU)]
+         load Q[3]: L2=[Q0:3,Q1:2,Q2:1,Q3:0], L1D evicts Q2→[Q0(LRU),Q3]
+         Now Q[0] is in L1D AND is the L2-LRU.
+         load Q[4]: L2 evicts Q[0] → invalidates L1D copy of Q[0]             */
+    init_cache(LRU);
 
     read_cache(Q[0], DATA);
     read_cache(Q[1], DATA);
-    read_cache(Q[2], DATA);   /* rand()%2 = 1 → L1D evicts Q[1], loads Q[2] */
-    read_cache(Q[3], DATA);   /* rand()%2 = 0 → L1D evicts Q[0], loads Q[3] */
+    read_cache(Q[0], DATA);   /* L1D hit: keeps Q[0] MRU in L1D, no L2 touch */
+    read_cache(Q[2], DATA);   /* L1D miss: evicts Q[1], Q[0] becomes L1D-LRU  */
+    read_cache(Q[0], DATA);   /* L1D hit: keeps Q[0] MRU in L1D, no L2 touch */
+    read_cache(Q[3], DATA);   /* L1D miss: evicts Q[2]; Q[0] in L1D & L2-LRU */
 
-    /* At this point L1D has Q[2](way0) and Q[3](way1), L2 has Q[0]-Q[3]. */
-    CHECK(get_l1_data_cache_line(Q[2]) != NULL, "Q[2] in L1D before trigger");
+    CHECK(get_l1_data_cache_line(Q[0]) != NULL, "Q[0] in L1D before trigger");
     CHECK(get_l1_data_cache_line(Q[3]) != NULL, "Q[3] in L1D before trigger");
 
-    read_cache(Q[4], DATA);   /* L2 rand evicts Q[3] which is still in L1D */
+    read_cache(Q[4], DATA);   /* L2 evicts Q[0] (LRU), must invalidate L1D   */
 
-    CHECK(get_l1_data_cache_line(Q[3]) == NULL,
-          "Q[3] invalidated in L1D when L2 evicted it (inclusivity)");
-    CHECK(get_l2_cache_line(Q[3])      == NULL,
-          "Q[3] no longer in L2");
+    CHECK(get_l1_data_cache_line(Q[0]) == NULL,
+          "Q[0] invalidated in L1D when L2 evicted it (inclusivity)");
+    CHECK(get_l2_cache_line(Q[0])      == NULL,
+          "Q[0] no longer in L2");
     CHECK(get_l1_data_cache_line(Q[4]) != NULL, "Q[4] loaded into vacated L1D slot");
 
     /* Data integrity: Q[4] was zero-initialised, should read back as 0 */
