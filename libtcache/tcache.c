@@ -295,15 +295,17 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
 
         /* Miss */
         l1d_stats.misses++;
-        int v = l1d_pick_victim(idx);
-
-        if (l1d[idx][v].valid && l1d[idx][v].modified)
-            l2_writeback(L1D_BASE(l1d[idx][v].tag, idx), &l1d[idx][v]);
 
         /* Coherence: flush dirty L1I to L2 before fetching */
         coherence_flush_l1i(base);
 
         cache_line_t *l2l = l2_fetch(base);
+        /* Pick victim after l2_fetch: eviction may have freed an L1D slot */
+        int v = l1d_pick_victim(idx);
+
+        if (l1d[idx][v].valid && l1d[idx][v].modified)
+            l2_writeback(L1D_BASE(l1d[idx][v].tag, idx), &l1d[idx][v]);
+
         memcpy(l1d[idx][v].data, l2l->data, LINE_SIZE);
         l1d[idx][v].valid    = 1;
         l1d[idx][v].modified = 0;
@@ -373,15 +375,17 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
 
         /* Miss — write-allocate */
         l1d_stats.misses++;
-        int v = l1d_pick_victim(idx);
-
-        if (l1d[idx][v].valid && l1d[idx][v].modified)
-            l2_writeback(L1D_BASE(l1d[idx][v].tag, idx), &l1d[idx][v]);
 
         /* Coherence: flush dirty L1I to L2 before fetching */
         coherence_invalidate_l1i(base);
 
         cache_line_t *l2l = l2_fetch(base);
+        /* Pick victim after l2_fetch: eviction may have freed an L1D slot */
+        int v = l1d_pick_victim(idx);
+
+        if (l1d[idx][v].valid && l1d[idx][v].modified)
+            l2_writeback(L1D_BASE(l1d[idx][v].tag, idx), &l1d[idx][v]);
+
         memcpy(l1d[idx][v].data, l2l->data, LINE_SIZE);
         l1d[idx][v].valid     = 1;
         l1d[idx][v].tag       = tag;
