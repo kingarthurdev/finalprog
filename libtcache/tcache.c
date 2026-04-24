@@ -170,10 +170,8 @@ static void l2_evict_line(uint32_t idx, int way) {
                     for (int b = 0; b < LINE_SIZE; b++)
                         write_memory(vbase + b, l1d[i][w].data[b]);
                     l1_wrote = true;
-                    l1d[i][w].modified = 0;   /* written to memory; keep valid */
-                } else {
-                    l1d[i][w].valid = 0;      /* back-invalidate clean line */
                 }
+                l1d[i][w].valid = l1d[i][w].modified = 0;   /* always back-invalidate */
                 break;
             }
         }
